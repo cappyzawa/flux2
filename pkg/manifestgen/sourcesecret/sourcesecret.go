@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/fluxcd/pkg/git/github"
+	"github.com/fluxcd/pkg/runtime/secrets"
 	cryptssh "golang.org/x/crypto/ssh"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -132,79 +133,110 @@ func LoadKeyPair(privateKey []byte, password string) (*ssh.KeyPair, error) {
 }
 
 func buildSecret(keypair *ssh.KeyPair, hostKey, dockerCfg []byte, options Options) (secret corev1.Secret) {
-	secret.TypeMeta = metav1.TypeMeta{
-		APIVersion: "v1",
-		Kind:       "Secret",
-	}
-	secret.ObjectMeta = metav1.ObjectMeta{
-		Name:      options.Name,
-		Namespace: options.Namespace,
-	}
+	// Demonstrates runtime/secrets integration issues:
+	// 1. Early returns prevent multi-key combinations that were previously possible
+	// 2. Runtime/secrets functions are type-specific and mutually exclusive
+	// 3. Many use cases (SSH, GitHub App, Notation) have no runtime/secrets equivalent
+
+	secret.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"}
+	secret.ObjectMeta = metav1.ObjectMeta{Name: options.Name, Namespace: options.Namespace}
 	secret.Labels = options.Labels
 	secret.StringData = map[string]string{}
 
-	if dockerCfg != nil {
-		secret.Type = corev1.SecretTypeDockerConfigJson
-		secret.StringData[corev1.DockerConfigJsonKey] = string(dockerCfg)
-		return
+	// Docker registry case: Use runtime/secrets.MakeRegistrySecret and return early
+	if dockerCfg != nil && options.Registry != "" && options.Username != "" && options.Password != "" {
+		runtimeSecret, err := secrets.MakeRegistrySecret(options.Name, options.Namespace, options.Registry, options.Username, options.Password)
+		if err == nil {
+			secret = *runtimeSecret
+			secret.Labels = options.Labels
+			secret.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"}
+			return secret
+		}
 	}
 
-	if options.Address != "" {
-		secret.StringData[AddressSecretKey] = options.Address
-	}
-
+	// Basic auth case: Use runtime/secrets.MakeBasicAuthSecret and return early
 	if options.Username != "" && options.Password != "" {
-		secret.StringData[UsernameSecretKey] = options.Username
-		secret.StringData[PasswordSecretKey] = options.Password
+		runtimeSecret, err := secrets.MakeBasicAuthSecret(options.Name, options.Namespace, options.Username, options.Password)
+		if err == nil {
+			secret = *runtimeSecret
+			secret.Labels = options.Labels 
+			secret.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"}
+			return secret
+		}
 	}
+	
+	// Bearer token case: Use runtime/secrets.MakeBearerTokenSecret and return early
 	if options.BearerToken != "" {
-		secret.StringData[BearerTokenKey] = options.BearerToken
+		runtimeSecret, err := secrets.MakeBearerTokenSecret(options.Name, options.Namespace, options.BearerToken)
+		if err == nil {
+			secret = *runtimeSecret
+			secret.Labels = options.Labels
+			secret.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"}
+			return secret
+		}
 	}
 
-	if len(options.CACrt) != 0 {
-		secret.StringData[CACrtSecretKey] = string(options.CACrt)
-	}
-
+	// TLS case: Use runtime/secrets.MakeTLSSecret and return early
 	if len(options.TLSCrt) != 0 && len(options.TLSKey) != 0 {
-		secret.Type = corev1.SecretTypeTLS
-		secret.StringData[TLSCrtSecretKey] = string(options.TLSCrt)
-		secret.StringData[TLSKeySecretKey] = string(options.TLSKey)
+		var tlsOpts []secrets.TLSSecretOption
+		tlsOpts = append(tlsOpts, secrets.WithCertKeyPair(options.TLSCrt, options.TLSKey))
+		if len(options.CACrt) != 0 {
+			tlsOpts = append(tlsOpts, secrets.WithCAData(options.CACrt))
+		}
+		
+		runtimeSecret, err := secrets.MakeTLSSecret(options.Name, options.Namespace, tlsOpts...)
+		if err == nil {
+			secret = *runtimeSecret
+			secret.Labels = options.Labels
+			secret.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"}
+			return secret
+		}
 	}
 
+	// Proxy case: Use runtime/secrets.MakeProxySecret and return early
+	if options.Address != "" && options.Username != "" && options.Password != "" {
+		runtimeSecret, err := secrets.MakeProxySecret(options.Name, options.Namespace, options.Address, options.Username, options.Password)
+		if err == nil {
+			secret = *runtimeSecret
+			secret.Labels = options.Labels
+			secret.TypeMeta = metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"}
+			return secret
+		}
+	}
+
+	// Manual handling for cases not covered by runtime/secrets
+	// SSH case: No runtime/secrets function for this
 	if keypair != nil && len(hostKey) != 0 {
 		secret.StringData[PrivateKeySecretKey] = string(keypair.PrivateKey)
 		secret.StringData[PublicKeySecretKey] = string(keypair.PublicKey)
 		secret.StringData[KnownHostsSecretKey] = string(hostKey)
-		// set password if present
 		if options.Password != "" {
-			secret.StringData[PasswordSecretKey] = string(options.Password)
+			secret.StringData[PasswordSecretKey] = options.Password
 		}
 	}
 
+	// GitHub App case: No runtime/secrets function for this
+	if options.GitHubAppID != "" {
+		secret.StringData[github.AppIDKey] = options.GitHubAppID
+	}
+	if options.GitHubAppInstallationID != "" {
+		secret.StringData[github.AppInstallationIDKey] = options.GitHubAppInstallationID
+	}
+	if options.GitHubAppPrivateKey != "" {
+		secret.StringData[github.AppPrivateKey] = options.GitHubAppPrivateKey
+	}
+	if options.GitHubAppBaseURL != "" {
+		secret.StringData[github.AppBaseUrlKey] = options.GitHubAppBaseURL
+	}
+
+	// Notation case: No runtime/secrets function for this
 	if len(options.VerificationCrts) != 0 {
 		for _, crts := range options.VerificationCrts {
 			secret.StringData[crts.Name] = string(crts.CACrt)
 		}
 	}
-
 	if len(options.TrustPolicy) != 0 {
 		secret.StringData[TrustPolicyKey] = string(options.TrustPolicy)
-	}
-
-	if options.GitHubAppID != "" {
-		secret.StringData[github.AppIDKey] = options.GitHubAppID
-	}
-
-	if options.GitHubAppInstallationID != "" {
-		secret.StringData[github.AppInstallationIDKey] = options.GitHubAppInstallationID
-	}
-
-	if options.GitHubAppPrivateKey != "" {
-		secret.StringData[github.AppPrivateKey] = options.GitHubAppPrivateKey
-	}
-
-	if options.GitHubAppBaseURL != "" {
-		secret.StringData[github.AppBaseUrlKey] = options.GitHubAppBaseURL
 	}
 
 	return
